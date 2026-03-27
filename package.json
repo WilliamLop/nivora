@@ -1,0 +1,25 @@
+{
+  "name": "nivora",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Nivora dashboard for outbound lead generation.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "verify:supabase-crm": "bash scripts/verify_supabase_crm.sh"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.56.0",
+    "next": "16.1.5",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.5.2",
+    "@types/react": "19.1.13",
+    "@types/react-dom": "19.1.9",
+    "typescript": "5.9.2"
+  }
+}

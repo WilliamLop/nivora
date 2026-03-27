@@ -1,0 +1,2 @@
+businessName,city,niche,phone,email,website,websiteStatus,digitalPresence,painPoints,notes,source,offerType,stage,lastTouch
+"Codex Import QA","Leeds","QA Services","+44 113 555 0999","qa-import@example.com","https://qa-import.example.com","weak","low","Outdated website | No CTA","Archivo de prueba para validar importacion real desde UI.","Playwright QA","Landing + intake automation","contacted","2026-03-17"
