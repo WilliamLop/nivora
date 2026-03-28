@@ -64,9 +64,14 @@ export type InternalChecklistItem = {
 // ── CSV import preview ────────────────────────────────────────────────────────
 export type ImportPreview = {
   totalRows: number;
+  nonEmptyRows: number;
+  validRows: number;
+  emptyRows: number;
+  invalidRows: number;
   detectedSource: string;
   topSubniches: Array<{ label: string; total: number }>;
   sampleBusinesses: string[];
+  skippedRows: Array<{ label: string; total: number }>;
 };
 
 // ── Catalog summaries (enriched views of raw data) ───────────────────────────

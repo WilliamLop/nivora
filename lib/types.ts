@@ -119,7 +119,9 @@ export interface Lead {
   aiEnrichedAt?: string;
 }
 
-export type AiImportPhase = "disabled" | "success" | "partial" | "fallback";
+export type AiImportPhase = "disabled" | "queued" | "running" | "success" | "partial" | "fallback";
+
+export type AiImportJobStatus = "queued" | "running" | "completed" | "completed_with_errors" | "failed";
 
 export interface AiImportStatus {
   phase: AiImportPhase;
@@ -130,6 +132,27 @@ export interface AiImportStatus {
   writerModel: string;
   message: string;
   error?: string;
+}
+
+export interface AiImportJob {
+  id: string;
+  status: AiImportJobStatus;
+  batchId: string;
+  batchName: string;
+  importFileName: string;
+  totalLeads: number;
+  processedLeads: number;
+  enrichedLeads: number;
+  failedLeads: number;
+  classifierModel: string;
+  writerModel: string;
+  createdByUserId?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  lastHeartbeatAt?: string;
 }
 
 export interface DashboardLead extends Lead {
@@ -192,6 +215,7 @@ export interface DashboardBootstrap {
   markets: Market[];
   segments: Segment[];
   batches: Batch[];
+  aiImportJobs: AiImportJob[];
   currentUser?: AuthenticatedUser;
   teamMembers: TeamMember[];
   segmentAssignments: SegmentAssignment[];
@@ -228,5 +252,12 @@ export interface ProposalCopy {
 export interface ImportResult {
   leads: Lead[];
   skippedDuplicates: number;
+  aiStatus: AiImportStatus;
+  aiJob?: AiImportJob;
+}
+
+export interface AiImportJobProcessResult {
+  job: AiImportJob;
+  leads: Lead[];
   aiStatus: AiImportStatus;
 }

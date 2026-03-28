@@ -1,11 +1,15 @@
 import type { AiImportStatus, Lead, ProposalServiceId } from "@/lib/types";
 
 const OPENAI_API_URL = process.env.OPENAI_API_URL?.trim() || "https://api.openai.com/v1/responses";
-const OPENAI_CLASSIFIER_MODEL = process.env.OPENAI_CLASSIFIER_MODEL?.trim() || "gpt-5-nano";
-const OPENAI_WRITER_MODEL =
+export const OPENAI_CLASSIFIER_MODEL = process.env.OPENAI_CLASSIFIER_MODEL?.trim() || "gpt-5-nano";
+export const OPENAI_WRITER_MODEL =
   process.env.OPENAI_WRITER_MODEL?.trim() || process.env.OPENAI_COPY_MODEL?.trim() || "gpt-4o-mini";
 const OPENAI_TIMEOUT_MS = clampNumber(process.env.OPENAI_TIMEOUT_MS, 4_000, 60_000, 45_000);
 const OPENAI_IMPORT_CHUNK_SIZE = clampNumber(process.env.OPENAI_IMPORT_CHUNK_SIZE, 4, 20, 8);
+
+export function isAiImportEnabled() {
+  return Boolean(process.env.OPENAI_API_KEY);
+}
 
 const PROPOSAL_SERVICE_IDS: ProposalServiceId[] = [
   "landing_conversion",
@@ -628,7 +632,7 @@ function sanitizeDraftPayload(payload: DraftPayload, leads: Lead[]): DraftPayloa
   };
 }
 
-function hasAiSignals(lead: Lead) {
+export function hasAiSignals(lead: Lead) {
   return Boolean(
     lead.aiServiceId ||
       lead.aiServiceReason ||

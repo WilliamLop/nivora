@@ -1,4 +1,5 @@
 import { STAGES } from "./dashboard";
+import type { CsvImportAnalysis } from "./dashboard";
 import type { DashboardLead, DashboardStatus, DataMode, PriorityTone } from "./types";
 import type { DisplayStatus, ImportPreview } from "./component-types";
 import type { WorkspaceFocus } from "./types";
@@ -60,6 +61,7 @@ function getSuccessMessage(title: string) {
   const messages: Record<string, string> = {
     "Lead guardado": "El negocio quedo listo para seguimiento y ya esta en el tablero compartido.",
     "Importacion guardada": "La carga masiva ya quedo disponible para trabajarla desde el CRM.",
+    "Importacion guardada, IA en progreso": "La carga ya quedó disponible y la IA la está enriqueciendo por lotes en segundo plano.",
     "Importacion guardada con IA": "La carga masiva se enriquecio con IA y ya quedo disponible en el CRM.",
     "Importacion parcial con IA": "La carga masiva se guardo, pero la IA solo enriquecio parte del lote.",
     "Importacion guardada sin IA": "La carga masiva se guardo sin enriquecimiento de IA.",
@@ -129,57 +131,99 @@ export function getImmediateTasks(leads: DashboardLead[]) {
 // ── Import helpers ────────────────────────────────────────────────────────────
 
 export function buildImportPreview(
-  rows: Array<Record<string, string>>,
-  focus: WorkspaceFocus
+  analysis: CsvImportAnalysis
 ): ImportPreview {
   const counts = new Map<string, number>();
   const sampleBusinesses: string[] = [];
-  const detectedSource = rows[0] && isGoogleMapsCsvRow(rows[0]) ? "Google Maps export" : "CSV estructurado";
+  const skippedCounts = new Map<string, number>();
 
-  rows.forEach((row, index) => {
-    const subniche =
-      readCsvField(row, ["subniche", "subnicho", "specialty", "niche", "nicho", "segment", "segmento"]) ||
-      readCsvField(row, ["category", "categoria", "categoría"]) ||
-      readCsvField(row, ["W4Efsd", "w4efsd"]) ||
-      focus.niche;
-    counts.set(subniche, (counts.get(subniche) || 0) + 1);
+  analysis.validRows.forEach((row, index) => {
+    const subniche = readCsvField(row, ["subniche", "subnicho", "specialty", "category", "categoria", "categoría"]);
+    if (subniche) {
+      counts.set(subniche, (counts.get(subniche) || 0) + 1);
+    }
 
     if (index < 3) {
       sampleBusinesses.push(
-        readCsvField(row, ["businessName", "business_name", "company", "nombre", "qBF1Pd", "qbf1pd"]) ||
+        readCsvField(row, ["businessName", "business_name", "company", "name", "nombre", "qBF1Pd", "qbf1pd"]) ||
           "Lead sin nombre"
       );
     }
   });
 
+  analysis.skippedRows.forEach((row) => {
+    skippedCounts.set(row.label, (skippedCounts.get(row.label) || 0) + 1);
+  });
+
   return {
-    totalRows: rows.length,
-    detectedSource,
+    totalRows: analysis.totalRows,
+    nonEmptyRows: analysis.nonEmptyRows,
+    validRows: analysis.validRows.length,
+    emptyRows: analysis.emptyRows,
+    invalidRows: analysis.invalidRows,
+    detectedSource: analysis.detectedSource,
     topSubniches: [...counts.entries()]
       .map(([label, total]) => ({ label, total }))
       .sort((a, b) => b.total - a.total)
       .slice(0, 4),
     sampleBusinesses,
+    skippedRows: [...skippedCounts.entries()]
+      .map(([label, total]) => ({ label, total }))
+      .sort((a, b) => b.total - a.total),
   };
 }
 
 export function buildImportReadyMessage(
   fileName: string,
-  rows: Array<Record<string, string>>,
+  analysis: CsvImportAnalysis,
   focus: WorkspaceFocus
 ) {
-  const totalRows = rows.length;
-  const sampleRow = rows[0];
-  if (!sampleRow) return `Archivo listo para importar: ${fileName}`;
+  const totalRows = analysis.validRows.length;
+  const sampleRow = analysis.validRows[0];
+  const skippedNote = formatImportOmissionSummary({
+    emptyRows: analysis.emptyRows,
+    invalidRows: analysis.invalidRows,
+    duplicates: 0,
+  });
+
+  if (!sampleRow) {
+    return analysis.nonEmptyRows
+      ? `Leí ${analysis.totalRows} filas en ${fileName}, pero ninguna trae un negocio reconocible para importar.`
+      : `No encontré filas útiles en ${fileName}. Sube un CSV o TXT delimitado con datos reales.`;
+  }
 
   if (isGoogleMapsCsvRow(sampleRow)) {
     const category =
-      readCsvField(sampleRow, ["W4Efsd", "w4efsd"]) ||
+      readCsvField(sampleRow, ["subniche", "W4Efsd", "w4efsd"]) ||
       readCsvField(sampleRow, ["category", "categoria", "categoría"]);
-    return `Archivo listo: ${fileName}. Detectados ${totalRows} negocios desde Google Maps${category ? ` (${category})` : ""}. Se guardaran en ${focus.city} / ${focus.niche} / ${focus.batchName}.`;
+    return `Archivo listo: ${fileName}. Detectados ${totalRows} negocios válidos desde Google Maps${category ? ` (${category})` : ""}.${skippedNote} Se guardaran en ${focus.city} / ${focus.niche} / ${focus.batchName}.`;
   }
 
-  return `Archivo listo: ${fileName}. ${totalRows} filas listas para importar en ${focus.batchName}.`;
+  return `Archivo listo: ${fileName}. ${totalRows} filas válidas listas para importar en ${focus.batchName}.${skippedNote}`;
+}
+
+export function formatImportOmissionSummary(counts: {
+  emptyRows: number;
+  invalidRows: number;
+  duplicates: number;
+}) {
+  const parts: string[] = [];
+
+  if (counts.emptyRows > 0) {
+    parts.push(`${counts.emptyRows} fila${counts.emptyRows === 1 ? "" : "s"} vacia${counts.emptyRows === 1 ? "" : "s"} omitida${counts.emptyRows === 1 ? "" : "s"}`);
+  }
+
+  if (counts.invalidRows > 0) {
+    parts.push(
+      `${counts.invalidRows} fila${counts.invalidRows === 1 ? "" : "s"} sin nombre reconocible omitida${counts.invalidRows === 1 ? "" : "s"}`
+    );
+  }
+
+  if (counts.duplicates > 0) {
+    parts.push(`${counts.duplicates} duplicado${counts.duplicates === 1 ? "" : "s"} omitido${counts.duplicates === 1 ? "" : "s"}`);
+  }
+
+  return parts.length ? ` ${parts.join(". ")}.` : "";
 }
 
 function isGoogleMapsCsvRow(row: Record<string, string>) {

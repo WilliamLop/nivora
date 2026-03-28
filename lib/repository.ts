@@ -9,7 +9,13 @@ import {
   normalizeOpsStatus,
   normalizeStage,
 } from "@/lib/dashboard";
-import { enrichImportedLeadsWithAi } from "@/lib/ai";
+import {
+  OPENAI_CLASSIFIER_MODEL,
+  OPENAI_WRITER_MODEL,
+  enrichImportedLeadsWithAi,
+  hasAiSignals,
+  isAiImportEnabled,
+} from "@/lib/ai";
 import {
   SAMPLE_BATCHES,
   SAMPLE_FOCUS,
@@ -22,6 +28,9 @@ import { getSupabaseAdmin, isSupabaseConfigured } from "@/lib/supabase-admin";
 import { createSupabaseUserClient } from "@/lib/supabase-auth";
 import type {
   AppRole,
+  AiImportJob,
+  AiImportJobProcessResult,
+  AiImportStatus,
   AuthenticatedUser,
   Batch,
   DashboardBootstrap,
@@ -161,6 +170,39 @@ type LeadActivityRow = {
   created_at: string;
 };
 
+type AiImportJobRow = {
+  id: string;
+  created_by_user_id?: string | null;
+  batch_id?: string | null;
+  batch_name: string;
+  import_file_name: string;
+  status: AiImportJob["status"];
+  total_leads: number;
+  processed_leads: number;
+  enriched_leads: number;
+  failed_leads: number;
+  classifier_model: string;
+  writer_model: string;
+  last_error?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  last_heartbeat_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type AiImportJobItemRow = {
+  id: string;
+  job_id: string;
+  lead_id: string;
+  status: "pending" | "processing" | "enriched" | "failed";
+  attempt_count: number;
+  last_error?: string | null;
+  locked_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 type MergeBatchMapping = {
   fromId: string;
   toId: string;
@@ -242,6 +284,7 @@ function buildPreviewBootstrap(options: {
     markets: SAMPLE_MARKETS,
     segments: SAMPLE_SEGMENTS,
     batches: SAMPLE_BATCHES,
+    aiImportJobs: [],
     currentUser: options.currentUser,
     teamMembers: [],
     segmentAssignments: [],
@@ -265,7 +308,7 @@ async function loadDashboardBootstrapForSession(session: AppSession): Promise<Da
 
   await ensureWorkspaceSettings(adminClient);
 
-  const [leadsResult, structured, teamMembers, segmentAssignments, workspaceResult] = await Promise.all([
+  const [leadsResult, structured, teamMembers, segmentAssignments, workspaceResult, aiImportJobs] = await Promise.all([
     userClient.from("leads").select("*").order("created_at", { ascending: false }).returns<LeadRow[]>(),
     loadStructuredRows(userClient),
     loadTeamMembersForSession(userClient, session),
@@ -273,6 +316,7 @@ async function loadDashboardBootstrapForSession(session: AppSession): Promise<Da
     session.member.role === "admin"
       ? userClient.from("workspace_settings").select("*").eq("id", "default").maybeSingle<WorkspaceRow>()
       : Promise.resolve({ data: null, error: null as unknown }),
+    session.member.role === "admin" ? loadActiveAiImportJobs(userClient) : Promise.resolve([] as AiImportJob[]),
   ]);
 
   if (leadsResult.error) {
@@ -299,6 +343,7 @@ async function loadDashboardBootstrapForSession(session: AppSession): Promise<Da
     markets: catalog.markets,
     segments: catalog.segments,
     batches: catalog.batches,
+    aiImportJobs,
     currentUser: session.member,
     teamMembers:
       session.member.role === "admin"
@@ -323,6 +368,24 @@ async function loadDashboardBootstrapForSession(session: AppSession): Promise<Da
           : "Solo ves los leads y segmentos que te fueron asignados.",
     },
   };
+}
+
+async function loadActiveAiImportJobs(userClient: ReturnType<typeof createSupabaseUserClient>) {
+  const { data, error } = await userClient
+    .from("ai_import_jobs")
+    .select("*")
+    .in("status", ["queued", "running"])
+    .order("created_at", { ascending: false })
+    .returns<AiImportJobRow[]>();
+
+  if (error) {
+    if (isMissingAiImportInfraError(error)) {
+      return [];
+    }
+    throw error;
+  }
+
+  return (data || []).map(mapAiImportJobRowToJob);
 }
 
 function deriveSetterFocus(
@@ -429,7 +492,7 @@ export async function createLead(lead: Lead, actorUserId?: string) {
   return mapLeadRowToLead(insertedRows[0]);
 }
 
-export async function importLeads(leads: Lead[], actorUserId?: string): Promise<ImportResult> {
+export async function importLeads(leads: Lead[], actorUserId?: string, importFileName?: string): Promise<ImportResult> {
   const supabase = requireSupabase();
   const normalizedLeads = leads.map((lead) => normalizeLead(lead, SAMPLE_FOCUS));
   const fingerprints = normalizedLeads.map(createLeadFingerprint);
@@ -468,31 +531,173 @@ export async function importLeads(leads: Lead[], actorUserId?: string): Promise<
   }
 
   const assignedLeads = await applySegmentAssignmentsToLeads(supabase, uniqueLeads, actorUserId);
+  await ensureStructureFromLeads(supabase, assignedLeads);
 
-  const enrichment = await enrichImportedLeadsWithAi(assignedLeads).catch((error) => ({
-    leads: assignedLeads,
-    status: {
-      phase: "fallback" as const,
-      attempted: true,
-      totalLeads: assignedLeads.length,
-      enrichedLeads: 0,
-      classifierModel: "gpt-5-nano",
-      writerModel: "gpt-4o-mini",
-      message: error instanceof Error ? error.message : "No pude enriquecer los leads con OpenAI.",
-      error: error instanceof Error ? error.message : "No pude enriquecer los leads con OpenAI.",
-    },
-  }));
-  const { leads: enrichedLeads, status: aiStatus } = enrichment;
+  const insertedRows = await insertLeadRowsWithFallback(supabase, assignedLeads);
+  const insertedLeads = insertedRows.map(mapLeadRowToLead);
+  const skippedDuplicates = normalizedLeads.length - uniqueLeads.length;
 
-  await ensureStructureFromLeads(supabase, enrichedLeads);
+  if (!isAiImportEnabled()) {
+    return {
+      leads: insertedLeads,
+      skippedDuplicates,
+      aiStatus: {
+        phase: "disabled",
+        attempted: false,
+        totalLeads: insertedLeads.length,
+        enrichedLeads: 0,
+        classifierModel: OPENAI_CLASSIFIER_MODEL,
+        writerModel: OPENAI_WRITER_MODEL,
+        message: "IA desactivada: falta OPENAI_API_KEY. La importación se guardó sin enriquecimiento.",
+      },
+    };
+  }
 
-  const insertedRows = await insertLeadRowsWithFallback(supabase, enrichedLeads);
+  try {
+    const aiJob = await createAiImportJob(supabase, insertedLeads, {
+      actorUserId,
+      importFileName,
+    });
 
-  return {
-    leads: insertedRows.map(mapLeadRowToLead),
-    skippedDuplicates: normalizedLeads.length - uniqueLeads.length,
-    aiStatus,
-  };
+    return {
+      leads: insertedLeads,
+      skippedDuplicates,
+      aiStatus: getAiStatusFromJob(aiJob),
+      aiJob,
+    };
+  } catch (error) {
+    return {
+      leads: insertedLeads,
+      skippedDuplicates,
+      aiStatus: buildAiWorkerUnavailableStatus(insertedLeads.length, error),
+    };
+  }
+}
+
+export async function processAiImportJob(jobId: string): Promise<AiImportJobProcessResult> {
+  const supabase = requireSupabase();
+  let job = await loadAiImportJobById(supabase, jobId);
+
+  if (!job) {
+    throw new Error("No encontré el worker de IA para esta importación.");
+  }
+
+  if (!isAiImportEnabled()) {
+    job = await updateAiImportJob(supabase, job.id, {
+      status: "failed",
+      last_error: "OPENAI_API_KEY no está configurada.",
+      finished_at: new Date().toISOString(),
+      last_heartbeat_at: new Date().toISOString(),
+    });
+
+    return { job, leads: [], aiStatus: getAiStatusFromJob(job) };
+  }
+
+  if (["completed", "completed_with_errors", "failed"].includes(job.status)) {
+    return { job, leads: [], aiStatus: getAiStatusFromJob(job) };
+  }
+
+  if (job.status === "queued") {
+    job = await updateAiImportJob(supabase, job.id, {
+      status: "running",
+      started_at: job.startedAt || new Date().toISOString(),
+      last_heartbeat_at: new Date().toISOString(),
+      last_error: "",
+    });
+  }
+
+  let claimedItems: AiImportJobItemRow[] = [];
+  const updatedLeads: Lead[] = [];
+
+  try {
+    claimedItems = await claimAiImportJobItems(supabase, job.id, 8);
+
+    if (!claimedItems.length) {
+      const refreshedJob = await refreshAiImportJobState(supabase, job.id);
+      return { job: refreshedJob, leads: [], aiStatus: getAiStatusFromJob(refreshedJob) };
+    }
+
+    const leadIds = claimedItems.map((item) => item.lead_id);
+    const { data: leadRows, error: leadsError } = await supabase
+      .from("leads")
+      .select("*")
+      .in("id", leadIds)
+      .returns<LeadRow[]>();
+
+    if (leadsError) {
+      throw leadsError;
+    }
+
+    const leadById = new Map((leadRows || []).map((row) => [row.id, mapLeadRowToLead(row)]));
+    const inputLeads = claimedItems
+      .map((item) => leadById.get(item.lead_id))
+      .filter(Boolean) as Lead[];
+
+    const enrichment = await enrichImportedLeadsWithAi(inputLeads).catch((error) => ({
+      leads: inputLeads,
+      status: {
+        phase: "fallback" as const,
+        attempted: true,
+        totalLeads: inputLeads.length,
+        enrichedLeads: 0,
+        classifierModel: OPENAI_CLASSIFIER_MODEL,
+        writerModel: OPENAI_WRITER_MODEL,
+        message: error instanceof Error ? error.message : "No pude enriquecer los leads con OpenAI.",
+        error: error instanceof Error ? error.message : "No pude enriquecer los leads con OpenAI.",
+      },
+    }));
+
+    const enrichedById = new Map(enrichment.leads.map((lead) => [lead.id, lead]));
+
+    for (const item of claimedItems) {
+      const nextLead = enrichedById.get(item.lead_id);
+
+      if (nextLead && hasAiSignals(nextLead)) {
+        const updatedLead = await updateLeadRowWithFallback(supabase, item.lead_id, nextLead);
+        updatedLeads.push(updatedLead ? mapLeadRowToLead(updatedLead) : nextLead);
+        const { error } = await supabase
+          .from("ai_import_job_items")
+          .update({ status: "enriched", last_error: "", locked_at: null })
+          .eq("id", item.id);
+        if (error) {
+          throw error;
+        }
+        continue;
+      }
+
+      const { error } = await supabase
+        .from("ai_import_job_items")
+        .update({
+          status: "failed",
+          last_error: enrichment.status.error || enrichment.status.message || "La IA no devolvio señales utiles.",
+          locked_at: null,
+        })
+        .eq("id", item.id);
+      if (error) {
+        throw error;
+      }
+    }
+
+    const refreshedJob = await refreshAiImportJobState(supabase, job.id, enrichment.status.error || "");
+    return {
+      job: refreshedJob,
+      leads: updatedLeads,
+      aiStatus: getAiStatusFromJob(refreshedJob),
+    };
+  } catch (error) {
+    const message = getErrorMessage(error, "No pude completar este lote del worker de IA.");
+
+    if (claimedItems.length) {
+      await settleClaimedAiImportJobItemsAfterError(supabase, claimedItems, message);
+    }
+
+    const refreshedJob = await refreshAiImportJobState(supabase, job.id, message);
+    return {
+      job: refreshedJob,
+      leads: updatedLeads,
+      aiStatus: getAiStatusFromJob(refreshedJob),
+    };
+  }
 }
 
 type LeadOpsInput = {
@@ -1358,6 +1563,200 @@ function requireSupabase() {
   return supabase;
 }
 
+async function createAiImportJob(
+  supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  leads: Lead[],
+  options?: { actorUserId?: string; importFileName?: string }
+) {
+  const firstLead = leads[0];
+  const { data: jobRow, error: jobError } = await supabase
+    .from("ai_import_jobs")
+    .insert([
+      {
+        created_by_user_id: options?.actorUserId || null,
+        batch_id: firstLead?.batchId || null,
+        batch_name: firstLead?.batchName || SAMPLE_FOCUS.batchName,
+        import_file_name: options?.importFileName || "",
+        status: "queued",
+        total_leads: leads.length,
+        processed_leads: 0,
+        enriched_leads: 0,
+        failed_leads: 0,
+        classifier_model: OPENAI_CLASSIFIER_MODEL,
+        writer_model: OPENAI_WRITER_MODEL,
+        last_error: "",
+      },
+    ])
+    .select("*")
+    .single<AiImportJobRow>();
+
+  if (jobError) {
+    throw jobError;
+  }
+
+  const { error: itemsError } = await supabase.from("ai_import_job_items").insert(
+    leads.map((lead) => ({
+      job_id: jobRow.id,
+      lead_id: lead.id,
+      status: "pending",
+      attempt_count: 0,
+      last_error: "",
+    }))
+  );
+
+  if (itemsError) {
+    await supabase.from("ai_import_jobs").delete().eq("id", jobRow.id);
+    throw itemsError;
+  }
+
+  return mapAiImportJobRowToJob(jobRow);
+}
+
+async function loadAiImportJobById(
+  supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  jobId: string
+) {
+  const { data, error } = await supabase
+    .from("ai_import_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .maybeSingle<AiImportJobRow>();
+
+  if (error) {
+    throw error;
+  }
+
+  return data ? mapAiImportJobRowToJob(data) : null;
+}
+
+async function updateAiImportJob(
+  supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  jobId: string,
+  update: Record<string, unknown>
+) {
+  const { data, error } = await supabase
+    .from("ai_import_jobs")
+    .update(update)
+    .eq("id", jobId)
+    .select("*")
+    .single<AiImportJobRow>();
+
+  if (error) {
+    throw error;
+  }
+
+  return mapAiImportJobRowToJob(data);
+}
+
+async function claimAiImportJobItems(
+  supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  jobId: string,
+  limit: number
+) {
+  const { data, error } = await supabase.rpc("claim_ai_import_job_items", {
+    p_job_id: jobId,
+    p_limit: limit,
+  });
+
+  if (error) {
+    throw error;
+  }
+
+  return (data || []) as AiImportJobItemRow[];
+}
+
+async function refreshAiImportJobState(
+  supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  jobId: string,
+  lastError = ""
+) {
+  const { data: items, error: itemsError } = await supabase
+    .from("ai_import_job_items")
+    .select("status,last_error")
+    .eq("job_id", jobId)
+    .returns<Array<Pick<AiImportJobItemRow, "status" | "last_error">>>();
+
+  if (itemsError) {
+    throw itemsError;
+  }
+
+  const summary = {
+    pending: 0,
+    processing: 0,
+    enriched: 0,
+    failed: 0,
+  };
+  let errorMessage = lastError.trim();
+
+  (items || []).forEach((item) => {
+    summary[item.status] += 1;
+    if (!errorMessage && item.last_error) {
+      errorMessage = item.last_error;
+    }
+  });
+
+  const processedLeads = summary.enriched + summary.failed;
+  const finished = summary.pending === 0 && summary.processing === 0;
+  const nextStatus: AiImportJob["status"] = finished
+    ? summary.failed > 0
+      ? summary.enriched > 0
+        ? "completed_with_errors"
+        : "failed"
+      : "completed"
+    : "running";
+
+  return updateAiImportJob(supabase, jobId, {
+    status: nextStatus,
+    processed_leads: processedLeads,
+    enriched_leads: summary.enriched,
+    failed_leads: summary.failed,
+    last_error: errorMessage,
+    last_heartbeat_at: new Date().toISOString(),
+    finished_at: finished ? new Date().toISOString() : null,
+  });
+}
+
+async function settleClaimedAiImportJobItemsAfterError(
+  supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  claimedItems: AiImportJobItemRow[],
+  errorMessage: string
+) {
+  const retryIds = claimedItems.filter((item) => item.attempt_count < 3).map((item) => item.id);
+  const failedIds = claimedItems.filter((item) => item.attempt_count >= 3).map((item) => item.id);
+
+  if (retryIds.length) {
+    const { error } = await supabase
+      .from("ai_import_job_items")
+      .update({
+        status: "pending",
+        locked_at: null,
+        last_error: errorMessage,
+      })
+      .in("id", retryIds)
+      .eq("status", "processing");
+
+    if (error) {
+      throw error;
+    }
+  }
+
+  if (failedIds.length) {
+    const { error } = await supabase
+      .from("ai_import_job_items")
+      .update({
+        status: "failed",
+        locked_at: null,
+        last_error: errorMessage,
+      })
+      .in("id", failedIds)
+      .eq("status", "processing");
+
+    if (error) {
+      throw error;
+    }
+  }
+}
+
 async function loadMarketById(
   supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
   id: string
@@ -1938,6 +2337,92 @@ function mapLeadRowToLead(row: LeadRow): Lead {
   );
 }
 
+function mapAiImportJobRowToJob(row: AiImportJobRow): AiImportJob {
+  return {
+    id: row.id,
+    status: row.status,
+    batchId: row.batch_id || "",
+    batchName: row.batch_name,
+    importFileName: row.import_file_name,
+    totalLeads: row.total_leads,
+    processedLeads: row.processed_leads,
+    enrichedLeads: row.enriched_leads,
+    failedLeads: row.failed_leads,
+    classifierModel: row.classifier_model,
+    writerModel: row.writer_model,
+    createdByUserId: row.created_by_user_id || undefined,
+    lastError: row.last_error || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    startedAt: row.started_at || undefined,
+    finishedAt: row.finished_at || undefined,
+    lastHeartbeatAt: row.last_heartbeat_at || undefined,
+  };
+}
+
+function getAiStatusFromJob(job: AiImportJob): AiImportStatus {
+  if (job.status === "queued") {
+    return {
+      phase: "queued",
+      attempted: true,
+      totalLeads: job.totalLeads,
+      enrichedLeads: job.enrichedLeads,
+      classifierModel: job.classifierModel,
+      writerModel: job.writerModel,
+      message: `IA en cola: ${job.enrichedLeads}/${job.totalLeads} leads enriquecidos pendientes con ${job.classifierModel} + ${job.writerModel}.`,
+    };
+  }
+
+  if (job.status === "running") {
+    return {
+      phase: "running",
+      attempted: true,
+      totalLeads: job.totalLeads,
+      enrichedLeads: job.enrichedLeads,
+      classifierModel: job.classifierModel,
+      writerModel: job.writerModel,
+      message: `IA en progreso: ${job.processedLeads}/${job.totalLeads} leads procesados, ${job.enrichedLeads} enriquecidos.`,
+      error: job.lastError || undefined,
+    };
+  }
+
+  if (job.status === "completed") {
+    return {
+      phase: "success",
+      attempted: true,
+      totalLeads: job.totalLeads,
+      enrichedLeads: job.enrichedLeads,
+      classifierModel: job.classifierModel,
+      writerModel: job.writerModel,
+      message: `IA activa: ${job.enrichedLeads}/${job.totalLeads} leads enriquecidos con ${job.classifierModel} + ${job.writerModel}.`,
+    };
+  }
+
+  if (job.status === "completed_with_errors") {
+    return {
+      phase: "partial",
+      attempted: true,
+      totalLeads: job.totalLeads,
+      enrichedLeads: job.enrichedLeads,
+      classifierModel: job.classifierModel,
+      writerModel: job.writerModel,
+      message: `IA parcial: ${job.enrichedLeads}/${job.totalLeads} leads enriquecidos. ${job.failedLeads} quedaron en fallback.`,
+      error: job.lastError || undefined,
+    };
+  }
+
+  return {
+    phase: "fallback",
+    attempted: true,
+    totalLeads: job.totalLeads,
+    enrichedLeads: job.enrichedLeads,
+    classifierModel: job.classifierModel,
+    writerModel: job.writerModel,
+    message: `IA detenida: no pude enriquecer este lote automáticamente.${job.lastError ? ` ${job.lastError}` : ""}`,
+    error: job.lastError || undefined,
+  };
+}
+
 function mapLeadToInsertRow(
   lead: Lead,
   options?: { includeFingerprint?: boolean; includeStructure?: boolean; includeAi?: boolean }
@@ -2140,6 +2625,38 @@ function getErrorMessage(error: unknown, fallback: string) {
   }
 
   return fallback;
+}
+
+function isMissingAiImportInfraError(error: unknown) {
+  const code =
+    typeof error === "object" && error && "code" in error && typeof error.code === "string" ? error.code : "";
+  const message = getErrorMessage(error, "").toLowerCase();
+
+  return (
+    code === "42P01" ||
+    code === "42883" ||
+    message.includes("ai_import_jobs") ||
+    message.includes("ai_import_job_items") ||
+    message.includes("claim_ai_import_job_items")
+  );
+}
+
+function buildAiWorkerUnavailableStatus(totalLeads: number, error: unknown): AiImportStatus {
+  const message = getErrorMessage(error, "No pude iniciar el worker de IA.");
+  const infraMessage = isMissingAiImportInfraError(error)
+    ? "La importación se guardó, pero el worker de IA todavía no está disponible en la base de datos."
+    : "La importación se guardó, pero no pude arrancar el worker de IA en segundo plano.";
+
+  return {
+    phase: "fallback",
+    attempted: true,
+    totalLeads,
+    enrichedLeads: 0,
+    classifierModel: OPENAI_CLASSIFIER_MODEL,
+    writerModel: OPENAI_WRITER_MODEL,
+    message: infraMessage,
+    error: message,
+  };
 }
 
 async function findExistingLeadWithoutFingerprint(

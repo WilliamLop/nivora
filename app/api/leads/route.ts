@@ -13,10 +13,10 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const session = await requireAdminSession();
-    const body = (await request.json()) as { lead?: Lead; leads?: Lead[] };
+    const body = (await request.json()) as { lead?: Lead; leads?: Lead[]; importFileName?: string };
 
     if (Array.isArray(body.leads)) {
-      const result = await importLeads(body.leads, session.userId);
+      const result = await importLeads(body.leads, session.userId, body.importFileName);
       return NextResponse.json(result);
     }
 

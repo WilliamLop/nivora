@@ -16,6 +16,7 @@ type ImportsViewProps = {
   importMessage: string;
   isImportDragOver: boolean;
   isSaving: boolean;
+  canImportCsv: boolean;
   importProgress: number;
   csvInputId: string;
   csvInputRef: RefObject<HTMLInputElement | null>;
@@ -39,6 +40,7 @@ export function ImportsView({
   importMessage,
   isImportDragOver,
   isSaving,
+  canImportCsv,
   importProgress,
   csvInputId,
   csvInputRef,
@@ -282,7 +284,7 @@ export function ImportsView({
                   className="button button-primary"
                   type="button"
                   onClick={onImportCsv}
-                  disabled={!selectedCsvFileName}
+                  disabled={!canImportCsv}
                 >
                   Guardar importacion
                 </button>
@@ -308,7 +310,21 @@ export function ImportsView({
                   <strong>Fuente</strong>
                   <span className="status-chip status-chip-local">{importPreview.detectedSource}</span>
                 </div>
-                <p>{importPreview.totalRows} filas detectadas dentro del archivo.</p>
+                <p>
+                  {importPreview.validRows} filas válidas de {importPreview.totalRows} detectadas dentro del archivo.
+                </p>
+              </article>
+              <article className="ops-mini-card">
+                <strong>Diagnostico de filas</strong>
+                <p>
+                  {importPreview.nonEmptyRows} con contenido / {importPreview.emptyRows} vacías / {importPreview.invalidRows} sin
+                  nombre reconocible
+                </p>
+                <p>
+                  {importPreview.skippedRows.length
+                    ? importPreview.skippedRows.map((item) => `${item.label} (${item.total})`).join(" / ")
+                    : "No detecté filas descartadas en el preview."}
+                </p>
               </article>
               <article className="ops-mini-card">
                 <strong>Especialidades detectadas</strong>

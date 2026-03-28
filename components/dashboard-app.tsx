@@ -13,6 +13,7 @@ import {
 
 import {
   STAGES,
+  analyzeCsvImport,
   buildBatchId,
   buildMarketId,
   buildProposal,
@@ -23,10 +24,11 @@ import {
   labelForAppRole,
   mapCsvRowToLead,
   normalizeFocus,
-  parseCsv,
 } from "@/lib/dashboard";
 import type {
   AppRole,
+  AiImportJob,
+  AiImportJobProcessResult,
   AiImportStatus,
   AuthenticatedUser,
   Batch,
@@ -44,6 +46,7 @@ import type {
   TeamMember,
   WorkspaceFocus,
 } from "@/lib/types";
+import type { CsvImportAnalysis } from "@/lib/dashboard";
 import type {
   DashboardView,
   FollowUpTimingFilter,
@@ -76,7 +79,6 @@ import {
   escapeHtml,
   isCsvLikeFile,
   formatFileSize,
-  formatSkippedDuplicates,
 } from "@/lib/component-helpers";
 import {
   getOperationalStatus,
@@ -87,6 +89,7 @@ import {
   getImmediateTasks,
   buildImportPreview,
   buildImportReadyMessage,
+  formatImportOmissionSummary,
   cleanStatusTitle,
   statusChipClass,
 } from "@/lib/ui-helpers";
@@ -286,7 +289,9 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
   );
   const [isSaving, setIsSaving] = useState(false);
   const [selectedCsvFile, setSelectedCsvFile] = useState<File | null>(null);
+  const [selectedCsvAnalysis, setSelectedCsvAnalysis] = useState<CsvImportAnalysis | null>(null);
   const [importPreview, setImportPreview] = useState<ReturnType<typeof buildImportPreview> | null>(null);
+  const [aiImportJobs, setAiImportJobs] = useState<AiImportJob[]>(initialData.aiImportJobs || []);
   const [isImportDragOver, setIsImportDragOver] = useState(false);
   const [importProgress, setImportProgress] = useState(0);
   const [isLeadEditorOpen, setIsLeadEditorOpen] = useState(false);
@@ -303,7 +308,9 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
   const deferredSearch = useDeferredValue(searchQuery);
   const csvInputRef = useRef<HTMLInputElement | null>(null);
   const importProgressTimerRef = useRef<number | null>(null);
+  const aiImportWorkersRef = useRef<Set<string>>(new Set());
   const selectedCsvFileName = selectedCsvFile?.name ?? "";
+  const canImportSelectedCsv = Boolean(selectedCsvFile && selectedCsvAnalysis?.validRows.length);
   const userRole = currentUser?.role || null;
   const isSetter = userRole === "setter";
   const isAdmin = userRole === "admin";
@@ -313,6 +320,15 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
   const canImport = !currentUser || isAdmin;
   const canManageTeam = isAdmin;
   const availableNavItems = useMemo(() => getNavItemsForRole(userRole), [userRole]);
+
+  function mergeIncomingLeadsById(nextLeads: Lead[]) {
+    if (!nextLeads.length) return;
+    setLeads((curr) => {
+      const byId = new Map(curr.map((lead) => [lead.id, lead]));
+      nextLeads.forEach((lead) => byId.set(lead.id, lead));
+      return [...byId.values()];
+    });
+  }
 
   // ── Derived data ──────────────────────────────────────────────────────────
   const dashboardLeads = useMemo(() => decorateLeads(leads), [leads]);
@@ -1027,6 +1043,29 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedFocus]);
 
+  useEffect(() => {
+    if (dataMode !== "cloud" || !isAdmin) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      const nextJob = aiImportJobs.find(
+        (job) => (job.status === "queued" || job.status === "running") && !aiImportWorkersRef.current.has(job.id)
+      );
+
+      if (!nextJob) {
+        return;
+      }
+
+      aiImportWorkersRef.current.add(nextJob.id);
+      void runAiImportJob(nextJob.id).finally(() => {
+        aiImportWorkersRef.current.delete(nextJob.id);
+      });
+    }, 900);
+
+    return () => window.clearInterval(intervalId);
+  }, [aiImportJobs, dataMode, isAdmin]);
+
   useEffect(() => () => clearImportProgressTimer(), []);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1046,6 +1085,40 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
       left.offerAddons.length === right.offerAddons.length &&
       left.offerAddons.every((addon, index) => addon === right.offerAddons[index])
     );
+  }
+
+  async function runAiImportJob(jobId: string) {
+    try {
+      const response = await apiRequest<AiImportJobProcessResult>(`/api/ai-import-jobs/${jobId}/process`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+
+      mergeIncomingLeadsById(response.leads);
+      setAiImportJobs((curr) => {
+        const next = curr.map((job) => (job.id === response.job.id ? response.job : job));
+        return next.filter((job) => job.status === "queued" || job.status === "running");
+      });
+
+      setStorageStatus({
+        tone:
+          response.job.status === "completed"
+            ? "cloud"
+            : response.job.status === "completed_with_errors"
+              ? "working"
+              : response.job.status === "failed"
+                ? "cloud"
+                : "working",
+        title: buildAiImportTitle(response.aiStatus),
+        message: response.aiStatus.message,
+      });
+    } catch (error) {
+      setStorageStatus({
+        tone: "error",
+        title: "Worker de IA pausado",
+        message: getErrorMessage(error),
+      });
+    }
   }
 
   function resolveMarketFocus(marketId: string, baseFocus: WorkspaceFocus = focus): WorkspaceFocus | null {
@@ -1734,6 +1807,10 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
   }
 
   function buildAiImportTitle(status: AiImportStatus) {
+    if (status.phase === "queued" || status.phase === "running") {
+      return "Importacion guardada, IA en progreso";
+    }
+
     if (status.phase === "success") {
       return "Importacion guardada con IA";
     }
@@ -1757,19 +1834,32 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
       setImportMessage("Selecciona un archivo y define ciudad, nicho e importacion antes de cargar.");
       return;
     }
-    if (!isCsvLikeFile(file)) {
-      clearCsvInput();
-      setImportMessage("Elige un archivo .csv o .txt con columnas delimitadas.");
-      return;
-    }
     setSelectedCsvFile(file);
     try {
-      const rows = parseCsv(await file.text());
-      setImportPreview(buildImportPreview(rows, focusDraft));
-      setImportMessage(buildImportReadyMessage(file.name, rows, focusDraft));
+      const analysis = analyzeCsvImport(await file.text());
+      const metadataNote = isCsvLikeFile(file) ? "" : " El archivo no venia marcado como CSV, pero el contenido si fue reconocido.";
+
+      setSelectedCsvAnalysis(analysis);
+      setImportPreview(buildImportPreview(analysis));
+
+      if (!analysis.validRows.length) {
+        setImportMessage(
+          analysis.nonEmptyRows
+            ? `Leí ${analysis.totalRows} filas en ${file.name}, pero ninguna trae un negocio reconocible para importar.${formatImportOmissionSummary({
+                emptyRows: analysis.emptyRows,
+                invalidRows: analysis.invalidRows,
+                duplicates: 0,
+              })}`
+            : `No encontré filas útiles en ${file.name}. Sube un CSV o TXT delimitado con datos reales.`
+        );
+        return;
+      }
+
+      setImportMessage(`${buildImportReadyMessage(file.name, analysis, focusDraft)}${metadataNote}`);
     } catch {
+      setSelectedCsvAnalysis(null);
       setImportPreview(null);
-      setImportMessage(`Archivo listo para importar: ${file.name}`);
+      setImportMessage(`No pude leer ${file.name} como texto delimitado. Prueba con un CSV o TXT exportado de nuevo.`);
     }
   }
 
@@ -1783,11 +1873,13 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
       setIsSaving(true);
       startImportProgressAnimation();
       await tickImportProgress(14, `Abriendo ${file.name}...`, 90);
-      const rows = parseCsv(await file.text());
-      await tickImportProgress(28, `Leyendo ${rows.length} filas...`, 90);
-      if (!rows.length) throw new Error("El archivo no trae filas para importar.");
+      const analysis = selectedCsvAnalysis ?? analyzeCsvImport(await file.text());
+      const rows = analysis.validRows;
+      await tickImportProgress(28, `Leyendo ${analysis.totalRows} filas (${rows.length} válidas)...`, 90);
+      if (!analysis.totalRows) throw new Error("El archivo no trae filas para importar.");
+      if (!rows.length) throw new Error("No encontre leads validos en el CSV.");
 
-      await tickImportProgress(48, "Detectando negocios y especialidades...", 80);
+      await tickImportProgress(48, "Canonizando columnas y detectando negocios...", 80);
       const parsedLeads = rows
         .map((row) => mapCsvRowToLead(row, destinationFocus))
         .filter((l) => Boolean(l.businessName && l.city));
@@ -1816,7 +1908,11 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
         };
         await tickImportProgress(100, `${uniqueLeads.length} leads cargados en borrador dentro de ${destinationFocus.batchName}.`, 180);
         setImportMessage(
-          `${uniqueLeads.length} leads cargados en borrador dentro de ${destinationFocus.batchName}.${formatSkippedDuplicates(localDuplicates)} ${formatAiImportNote(aiStatus)}`
+          `${uniqueLeads.length} leads cargados en borrador dentro de ${destinationFocus.batchName}.${formatImportOmissionSummary({
+            emptyRows: analysis.emptyRows,
+            invalidRows: analysis.invalidRows,
+            duplicates: localDuplicates,
+          })} ${formatAiImportNote(aiStatus)}`
         );
         setStorageStatus({
           tone: dataMode === "error" ? "error" : "preview",
@@ -1832,14 +1928,20 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
       }
 
       await tickImportProgress(86, "Guardando importacion en la base...", 90);
-      const response = await apiRequest<{ leads: Lead[]; skippedDuplicates: number; aiStatus: AiImportStatus }>("/api/leads", {
+      const response = await apiRequest<{ leads: Lead[]; skippedDuplicates: number; aiStatus: AiImportStatus; aiJob?: AiImportJob }>("/api/leads", {
         method: "POST",
-        body: JSON.stringify({ leads: uniqueLeads }),
+        body: JSON.stringify({ leads: uniqueLeads, importFileName: file.name }),
       });
-      const totalSkipped = localDuplicates + response.skippedDuplicates;
+      const totalDuplicateRows = localDuplicates + response.skippedDuplicates;
       setLeads((curr) => [...response.leads, ...curr]);
       response.leads.forEach((l) => mergeCatalogFromLead(l, setMarkets, setSegments, setBatches));
       setSelectedLeadId(response.leads[0]?.id ?? "");
+      if (response.aiJob) {
+        setAiImportJobs((curr) => {
+          const deduped = curr.filter((job) => job.id !== response.aiJob?.id);
+          return [response.aiJob as AiImportJob, ...deduped];
+        });
+      }
       const aiStatus: AiImportStatus =
         response.aiStatus ?? {
           phase: "disabled",
@@ -1857,10 +1959,17 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
         180
       );
       setImportMessage(
-        `${response.leads.length} leads importados en ${destinationFocus.batchName}.${formatSkippedDuplicates(totalSkipped)} ${aiNote}`
+        `${response.leads.length} leads importados en ${destinationFocus.batchName}.${formatImportOmissionSummary({
+          emptyRows: analysis.emptyRows,
+          invalidRows: analysis.invalidRows,
+          duplicates: totalDuplicateRows,
+        })} ${aiNote}`
       );
       setStorageStatus({
-        tone: aiStatus.phase === "success" ? "cloud" : "working",
+        tone:
+          aiStatus.phase === "queued" || aiStatus.phase === "running" || aiStatus.phase === "partial"
+            ? "working"
+            : "cloud",
         title: buildAiImportTitle(aiStatus),
         message: `${aiStatus.message} Guardado en ${destinationFocus.city} / ${destinationFocus.niche} / ${destinationFocus.batchName}.`,
       });
@@ -1879,6 +1988,7 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
   function clearCsvInput(options?: { resetProgress?: boolean }) {
     if (csvInputRef.current) csvInputRef.current.value = "";
     setSelectedCsvFile(null);
+    setSelectedCsvAnalysis(null);
     setImportPreview(null);
     setIsImportDragOver(false);
     if (options?.resetProgress !== false) {
@@ -2611,6 +2721,7 @@ export function DashboardApp({ initialData }: DashboardAppProps) {
             importMessage={importMessage}
             isImportDragOver={isImportDragOver}
             isSaving={isSaving}
+            canImportCsv={canImportSelectedCsv}
             importProgress={importProgress}
             csvInputId={CSV_INPUT_ID}
             csvInputRef={csvInputRef}

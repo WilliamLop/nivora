@@ -8,6 +8,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "npm run test:csv-import",
+    "test:csv-import": "node --experimental-strip-types --import ./scripts/register-ts-path-loader.mjs --test tests/*.test.ts",
     "verify:supabase-crm": "bash scripts/verify_supabase_crm.sh"
   },
   "dependencies": {
