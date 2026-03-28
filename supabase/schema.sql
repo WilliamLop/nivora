@@ -301,32 +301,55 @@ values ('default')
 on conflict (id) do nothing;
 
 insert into public.markets (id, name, description)
-select distinct
-  public.make_slug(source.city) as id,
-  source.city as name,
+select
+  source.id,
+  source.name,
   ''
 from (
-  select city from public.workspace_settings
-  union
-  select city from public.leads
+  select distinct on (public.make_slug(raw.city))
+    public.make_slug(raw.city) as id,
+    trim(raw.city) as name
+  from (
+    select city, 0 as source_priority from public.workspace_settings
+    union all
+    select city, 1 as source_priority from public.leads
+  ) as raw
+  where coalesce(trim(raw.city), '') <> ''
+  order by
+    public.make_slug(raw.city),
+    raw.source_priority,
+    char_length(trim(raw.city)) desc,
+    trim(raw.city)
 ) as source
-where coalesce(trim(source.city), '') <> ''
 on conflict (id) do update
 set name = excluded.name;
 
 insert into public.segments (id, market_id, name, description)
-select distinct
-  concat_ws('__', public.make_slug(source.city), public.make_slug(source.niche)) as id,
-  public.make_slug(source.city) as market_id,
-  source.niche as name,
+select
+  source.id,
+  source.market_id,
+  source.name,
   ''
 from (
-  select city, niche from public.workspace_settings
-  union
-  select city, niche from public.leads
+  select distinct on (concat_ws('__', public.make_slug(raw.city), public.make_slug(raw.niche)))
+    concat_ws('__', public.make_slug(raw.city), public.make_slug(raw.niche)) as id,
+    public.make_slug(raw.city) as market_id,
+    trim(raw.niche) as name
+  from (
+    select city, niche, 0 as source_priority from public.workspace_settings
+    union all
+    select city, niche, 1 as source_priority from public.leads
+  ) as raw
+  where coalesce(trim(raw.city), '') <> ''
+    and coalesce(trim(raw.niche), '') <> ''
+  order by
+    concat_ws('__', public.make_slug(raw.city), public.make_slug(raw.niche)),
+    raw.source_priority,
+    char_length(trim(raw.niche)) desc,
+    trim(raw.niche),
+    char_length(trim(raw.city)) desc,
+    trim(raw.city)
 ) as source
-where coalesce(trim(source.city), '') <> ''
-  and coalesce(trim(source.niche), '') <> ''
 on conflict (id) do update
 set market_id = excluded.market_id,
     name = excluded.name;
@@ -342,41 +365,71 @@ insert into public.batches (
   target_size,
   notes
 )
-select distinct
-  concat_ws(
-    '__',
-    public.make_slug(source.city),
-    public.make_slug(source.niche),
-    public.make_slug(source.batch_name)
-  ) as id,
-  public.make_slug(source.city) as market_id,
-  concat_ws('__', public.make_slug(source.city), public.make_slug(source.niche)) as segment_id,
-  source.batch_name as name,
+select
+  source.id,
+  source.market_id,
+  source.segment_id,
+  source.name,
   source.source,
   '',
   'active',
   source.target_size,
   ''
 from (
-  select
-    city,
-    niche,
-    coalesce(nullif(batch_name, ''), 'Base activa') as batch_name,
-    'Workspace selection'::text as source,
-    batch_size as target_size
-  from public.workspace_settings
-  union
-  select
-    city,
-    niche,
-    coalesce(nullif(batch_name, ''), 'Base activa') as batch_name,
-    'Lead backfill'::text as source,
-    25 as target_size
-  from public.leads
+  select distinct on (
+    concat_ws(
+      '__',
+      public.make_slug(raw.city),
+      public.make_slug(raw.niche),
+      public.make_slug(raw.batch_name)
+    )
+  )
+    concat_ws(
+      '__',
+      public.make_slug(raw.city),
+      public.make_slug(raw.niche),
+      public.make_slug(raw.batch_name)
+    ) as id,
+    public.make_slug(raw.city) as market_id,
+    concat_ws('__', public.make_slug(raw.city), public.make_slug(raw.niche)) as segment_id,
+    trim(raw.batch_name) as name,
+    raw.source,
+    raw.target_size
+  from (
+    select
+      city,
+      niche,
+      coalesce(nullif(trim(batch_name), ''), 'Base activa') as batch_name,
+      'Workspace selection'::text as source,
+      batch_size as target_size,
+      0 as source_priority
+    from public.workspace_settings
+    union all
+    select
+      city,
+      niche,
+      coalesce(nullif(trim(batch_name), ''), 'Base activa') as batch_name,
+      'Lead backfill'::text as source,
+      25 as target_size,
+      1 as source_priority
+    from public.leads
+  ) as raw
+  where coalesce(trim(raw.city), '') <> ''
+    and coalesce(trim(raw.niche), '') <> ''
+    and coalesce(trim(raw.batch_name), '') <> ''
+  order by
+    concat_ws(
+      '__',
+      public.make_slug(raw.city),
+      public.make_slug(raw.niche),
+      public.make_slug(raw.batch_name)
+    ),
+    raw.source_priority,
+    raw.target_size desc,
+    trim(raw.batch_name),
+    trim(raw.niche),
+    trim(raw.city)
 ) as source
-where coalesce(trim(source.city), '') <> ''
-  and coalesce(trim(source.niche), '') <> ''
-  and coalesce(trim(source.batch_name), '') <> ''
 on conflict (id) do update
 set market_id = excluded.market_id,
     segment_id = excluded.segment_id,
