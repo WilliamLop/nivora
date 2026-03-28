@@ -367,6 +367,72 @@ function detectCsvDelimiter(text: string) {
   ).delimiter;
 }
 
+const CSV_FIELD_ALIASES = {
+  address: ["address", "direccion", "dirección", "location", "ubicacion", "ubicación"],
+  businessName: [
+    "businessName",
+    "business_name",
+    "business name",
+    "name",
+    "business",
+    "company",
+    "company name",
+    "negocio",
+    "empresa",
+    "nombre",
+    "qBF1Pd",
+  ],
+  city: ["city", "ciudad"],
+  digitalPresence: ["digitalPresence", "digital_presence", "presencia digital"],
+  email: ["email", "correo", "correo electronico", "correo electrónico"],
+  explicitNiche: ["niche", "nicho", "segment", "segmento"],
+  lastTouch: ["lastTouch", "last_touch", "ultimo contacto", "último contacto"],
+  mapsUrl: ["mapsUrl", "maps_url", "maps url", "google maps url", "place url", "hfpxzc href"],
+  notes: ["notes", "notas", "comentarios", "comments"],
+  offerType: ["offerType", "offer_type", "oferta", "tipo de oferta"],
+  painPoints: ["painPoints", "pain_points", "pain points", "dolores", "pain"],
+  phone: ["phone", "phone_number", "phone number", "telefono", "teléfono", "mobile", "whatsapp", "UsdlK"],
+  rating: ["rating", "calificacion", "calificación", "score", "MW4etd"],
+  reviewSummary: ["reviewSummary", "review_summary", "review summary", "resena", "reseña", "e4rVHe", "ah5Ghc"],
+  reviews: [
+    "reviews",
+    "review_count",
+    "review count",
+    "resenas",
+    "reseñas",
+    "numero de resenas",
+    "numero de reseñas",
+    "número de reseñas",
+    "numero de reviews",
+    "review total",
+    "UY7F9",
+  ],
+  source: ["source", "fuente", "origen"],
+  stage: ["stage", "etapa"],
+  subniche: ["subniche", "sub_niche", "sub niche", "specialty", "especialidad", "categoria", "categoría", "category", "W4Efsd"],
+  website: ["website", "website_url", "website url", "sitio web", "sitio", "site", "web", "url", "lcr4fd href"],
+  websiteStatus: ["websiteStatus", "website_status", "estado del sitio", "estado sitio"],
+  batchName: ["batchName", "batch_name", "lote", "lot", "batch"],
+} as const;
+
+export type CsvImportSkipReason = "empty" | "missing_business_name";
+
+export type CsvImportSkippedRow = {
+  rowNumber: number;
+  reason: CsvImportSkipReason;
+  label: string;
+};
+
+export type CsvImportAnalysis = {
+  totalRows: number;
+  nonEmptyRows: number;
+  emptyRows: number;
+  invalidRows: number;
+  detectedSource: string;
+  validRows: Array<Record<string, string>>;
+  skippedRows: CsvImportSkippedRow[];
+};
+
 function getCsvValue(row: Record<string, string>, aliases: string[]) {
   for (const alias of aliases) {
     const directValue = row[alias];
@@ -383,6 +449,10 @@ function getCsvValue(row: Record<string, string>, aliases: string[]) {
   }
 
   return "";
+}
+
+function getCanonicalCsvValue(row: Record<string, string>, field: keyof typeof CSV_FIELD_ALIASES) {
+  return getCsvValue(row, [...CSV_FIELD_ALIASES[field]]);
 }
 
 function getCsvValues(row: Record<string, string>, aliases: string[]) {
@@ -1391,7 +1461,7 @@ Saludos,`,
   };
 }
 
-export function parseCsv(text: string): Array<Record<string, string>> {
+function parseCsvMatrix(text: string) {
   const normalizedText = text.replace(/^\uFEFF/, "");
   const delimiter = detectCsvDelimiter(normalizedText);
   const rows: string[][] = [];
@@ -1425,9 +1495,7 @@ export function parseCsv(text: string): Array<Record<string, string>> {
       }
 
       currentRow.push(currentCell);
-      if (currentRow.some((cell) => cell.trim() !== "")) {
-        rows.push(currentRow);
-      }
+      rows.push(currentRow);
       currentCell = "";
       currentRow = [];
       continue;
@@ -1436,59 +1504,169 @@ export function parseCsv(text: string): Array<Record<string, string>> {
     currentCell += char;
   }
 
-  currentRow.push(currentCell);
-  if (currentRow.some((cell) => cell.trim() !== "")) {
+  if (currentCell.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentCell);
     rows.push(currentRow);
   }
 
-  if (!rows.length) {
-    return [];
+  while (rows.length && rows[0].every((cell) => cell.trim() === "")) {
+    rows.shift();
   }
 
-  const headers = rows[0].map((header) => header.trim());
+  while (rows.length && rows[rows.length - 1].every((cell) => cell.trim() === "")) {
+    rows.pop();
+  }
 
-  return rows.slice(1).map((row) => {
-    const mapped: Record<string, string> = {};
+  if (!rows.length) {
+    return { headers: [] as string[], rows: [] as string[][] };
+  }
 
-    headers.forEach((header, headerIndex) => {
-      const value = (row[headerIndex] || "").trim();
-      const normalizedHeader = normalizeCsvHeader(header);
+  return {
+    headers: rows[0].map((header) => header.trim()),
+    rows: rows.slice(1),
+  };
+}
 
+function mapCsvCellsToRow(headers: string[], row: string[]) {
+  const mapped: Record<string, string> = {};
+
+  headers.forEach((header, headerIndex) => {
+    const value = (row[headerIndex] || "").trim();
+    const normalizedHeader = normalizeCsvHeader(header);
+
+    if (header) {
       mapped[header] = value;
+    }
 
-      if (normalizedHeader) {
-        mapped[normalizedHeader] = value;
-      }
-    });
-
-    return mapped;
+    if (normalizedHeader) {
+      mapped[normalizedHeader] = value;
+    }
   });
+
+  return mapped;
+}
+
+function isCsvRowEmpty(row: Record<string, string>) {
+  return !Object.values(row).some((value) => value.trim() !== "");
+}
+
+function canonizeCsvRow(row: Record<string, string>) {
+  const canonicalRow: Record<string, string> = { ...row };
+  const reviewSummary = getCanonicalCsvValue(row, "reviewSummary");
+  const address = getCanonicalCsvValue(row, "address") || getGoogleMapsAddress(row);
+
+  const canonicalValues: Array<[string, string]> = [
+    ["businessName", getCanonicalCsvValue(row, "businessName")],
+    ["subniche", getCanonicalCsvValue(row, "subniche")],
+    ["phone", getCanonicalCsvValue(row, "phone")],
+    ["website", getCanonicalCsvValue(row, "website")],
+    ["city", getCanonicalCsvValue(row, "city")],
+    ["address", address],
+    ["rating", getCanonicalCsvValue(row, "rating")],
+    ["reviews", getCanonicalCsvValue(row, "reviews")],
+    ["notes", getCanonicalCsvValue(row, "notes")],
+    ["mapsUrl", getCanonicalCsvValue(row, "mapsUrl")],
+    ["reviewSummary", reviewSummary],
+  ];
+
+  canonicalValues.forEach(([key, value]) => {
+    if (value) {
+      canonicalRow[key] = value;
+    }
+  });
+
+  return canonicalRow;
+}
+
+function getCsvSkipLabel(reason: CsvImportSkipReason) {
+  return reason === "empty" ? "Filas vacias" : "Filas sin nombre reconocible";
+}
+
+export function analyzeCsvImport(text: string): CsvImportAnalysis {
+  const { headers, rows } = parseCsvMatrix(text);
+
+  if (!headers.length) {
+    return {
+      totalRows: 0,
+      nonEmptyRows: 0,
+      emptyRows: 0,
+      invalidRows: 0,
+      detectedSource: "CSV estructurado",
+      validRows: [],
+      skippedRows: [],
+    };
+  }
+
+  const rawRows = rows.map((row) => mapCsvCellsToRow(headers, row));
+  const firstNonEmptyRow = rawRows.find((row) => !isCsvRowEmpty(row));
+  const detectedSource = firstNonEmptyRow && isGoogleMapsExportRow(firstNonEmptyRow) ? "Google Maps export" : "CSV estructurado";
+  const skippedRows: CsvImportSkippedRow[] = [];
+  const validRows: Array<Record<string, string>> = [];
+  let emptyRows = 0;
+  let invalidRows = 0;
+
+  rawRows.forEach((row, rowIndex) => {
+    if (isCsvRowEmpty(row)) {
+      emptyRows += 1;
+      skippedRows.push({
+        rowNumber: rowIndex + 2,
+        reason: "empty",
+        label: getCsvSkipLabel("empty"),
+      });
+      return;
+    }
+
+    const canonicalRow = canonizeCsvRow(row);
+
+    if (!getCanonicalCsvValue(canonicalRow, "businessName")) {
+      invalidRows += 1;
+      skippedRows.push({
+        rowNumber: rowIndex + 2,
+        reason: "missing_business_name",
+        label: getCsvSkipLabel("missing_business_name"),
+      });
+      return;
+    }
+
+    validRows.push(canonicalRow);
+  });
+
+  return {
+    totalRows: rawRows.length,
+    nonEmptyRows: rawRows.length - emptyRows,
+    emptyRows,
+    invalidRows,
+    detectedSource,
+    validRows,
+    skippedRows,
+  };
+}
+
+export function parseCsv(text: string): Array<Record<string, string>> {
+  return analyzeCsvImport(text).validRows;
 }
 
 export function mapCsvRowToLead(row: Record<string, string>, focus: WorkspaceFocus): Lead {
-  const mapsUrl = getCsvValue(row, ["hfpxzc href", "maps url", "google maps url", "place url"]);
-  const googleMapsBusinessName = getCsvValue(row, ["qBF1Pd"]);
-  const googleMapsCategory = getCsvValue(row, ["W4Efsd"]);
-  const googleMapsPhone = getCsvValue(row, ["UsdlK"]);
-  const googleMapsWebsite = getCsvValue(row, ["lcr4fd href"]);
-  const googleMapsReviewSummary = getCsvValue(row, ["e4rVHe"]);
-  const googleMapsRating = getCsvValue(row, ["MW4etd"]);
-  const googleMapsReviewsCount = parseGoogleMapsReviewsCount(getCsvValue(row, ["UY7F9"]));
-  const googleMapsAddress = getGoogleMapsAddress(row);
+  const mapsUrl = getCanonicalCsvValue(row, "mapsUrl");
+  const googleMapsBusinessName = getCsvValue(row, ["qBF1Pd", "businessName"]);
+  const googleMapsCategory = getCsvValue(row, ["W4Efsd", "subniche"]);
+  const googleMapsPhone = getCanonicalCsvValue(row, "phone");
+  const googleMapsWebsite = getCanonicalCsvValue(row, "website");
+  const googleMapsReviewSummary = getCanonicalCsvValue(row, "reviewSummary");
+  const googleMapsRating = getCanonicalCsvValue(row, "rating");
+  const googleMapsReviewsCount = parseGoogleMapsReviewsCount(getCanonicalCsvValue(row, "reviews"));
+  const googleMapsAddress = getCanonicalCsvValue(row, "address") || getGoogleMapsAddress(row);
   const googleMapsStatus = getGoogleMapsStatus(row);
   const isGoogleMapsRow = isGoogleMapsExportRow(row);
-  const city = getCsvValue(row, ["city", "ciudad"]) || focus.city;
+  const city = getCanonicalCsvValue(row, "city") || focus.city;
   const macroNiche =
     getCsvValue(row, ["macroNiche", "macro_niche", "macro niche", "vertical", "vertical principal"]) || focus.niche;
-  const batchName = getCsvValue(row, ["batchName", "batch_name", "lote", "lot", "batch"]) || focus.batchName;
-  const explicitNiche = getCsvValue(row, ["niche", "nicho", "segment", "segmento"]);
-  const csvSubniche = getCsvValue(
-    row,
-    ["subniche", "sub_niche", "sub niche", "specialty", "especialidad", "categoria", "categoría", "category"]
-  );
-  const website = getCsvValue(row, ["website", "sitio web", "sitio", "web", "url"]) || googleMapsWebsite;
-  const phone = getCsvValue(row, ["phone", "telefono", "teléfono", "mobile", "whatsapp"]) || googleMapsPhone;
-  const notes = getCsvValue(row, ["notes", "notas", "comentarios"]);
+  const batchName = getCanonicalCsvValue(row, "batchName") || focus.batchName;
+  const explicitNiche = getCanonicalCsvValue(row, "explicitNiche");
+  const csvSubniche = getCanonicalCsvValue(row, "subniche");
+  const website = getCanonicalCsvValue(row, "website") || googleMapsWebsite;
+  const phone = getCanonicalCsvValue(row, "phone") || googleMapsPhone;
+  const notes = getCanonicalCsvValue(row, "notes");
   const inferredPainPoints = inferGoogleMapsPainPoints(
     website,
     phone,
@@ -1498,42 +1676,33 @@ export function mapCsvRowToLead(row: Record<string, string>, focus: WorkspaceFoc
 
   return normalizeLead(
     {
-      businessName: getCsvValue(row, [
-        "businessName",
-        "business_name",
-        "business name",
-        "company",
-        "company name",
-        "negocio",
-        "empresa",
-        "nombre",
-      ]) || googleMapsBusinessName,
+      businessName: getCanonicalCsvValue(row, "businessName") || googleMapsBusinessName,
       city,
       niche: macroNiche,
       subniche: csvSubniche || googleMapsCategory || explicitNiche || macroNiche,
       batchName,
       phone,
-      email: getCsvValue(row, ["email", "correo", "correo electronico", "correo electrónico"]),
+      email: getCanonicalCsvValue(row, "email"),
       website,
       source:
-        getCsvValue(row, ["source", "fuente", "origen"]) ||
+        getCanonicalCsvValue(row, "source") ||
         (isGoogleMapsRow ? "Google Maps export" : "CSV import"),
       websiteStatus: normalizeWebsiteStatus(
-        getCsvValue(row, ["websiteStatus", "website_status", "estado del sitio", "estado sitio"]) ||
+        getCanonicalCsvValue(row, "websiteStatus") ||
           (isGoogleMapsRow ? inferGoogleMapsWebsiteStatus(website) : "")
       ),
       digitalPresence: normalizeDigitalPresence(
-        getCsvValue(row, ["digitalPresence", "digital_presence", "presencia digital"]) ||
+        getCanonicalCsvValue(row, "digitalPresence") ||
           (isGoogleMapsRow
             ? inferGoogleMapsDigitalPresence(website, googleMapsReviewsCount, googleMapsReviewSummary)
             : "")
       ),
       painPoints: normalizePainPoints(
-        getCsvValue(row, ["painPoints", "pain_points", "pain points", "dolores", "pain"]) ||
+        getCanonicalCsvValue(row, "painPoints") ||
           (isGoogleMapsRow ? inferredPainPoints.join(" | ") : "")
       ),
-      offerType: getCsvValue(row, ["offerType", "offer_type", "oferta", "tipo de oferta"]) || focus.offer,
-      stage: normalizeStage(getCsvValue(row, ["stage", "etapa"]) || "sourced"),
+      offerType: getCanonicalCsvValue(row, "offerType") || focus.offer,
+      stage: normalizeStage(getCanonicalCsvValue(row, "stage") || "sourced"),
       notes: isGoogleMapsRow
         ? buildGoogleMapsNotes(
             googleMapsAddress,
@@ -1545,9 +1714,7 @@ export function mapCsvRowToLead(row: Record<string, string>, focus: WorkspaceFoc
             notes
           )
         : notes,
-      lastTouch:
-        getCsvValue(row, ["lastTouch", "last_touch", "ultimo contacto", "último contacto"]) ||
-        new Date().toISOString().slice(0, 10),
+      lastTouch: getCanonicalCsvValue(row, "lastTouch") || new Date().toISOString().slice(0, 10),
     },
     focus
   );

@@ -237,6 +237,54 @@ create table if not exists public.lead_activities (
   created_at timestamptz not null default timezone('utc', now())
 );
 
+create table if not exists public.ai_import_jobs (
+  id uuid primary key default gen_random_uuid(),
+  created_by_user_id uuid references public.team_members(id) on delete set null,
+  batch_id text references public.batches(id) on delete set null,
+  batch_name text not null default 'Base activa',
+  import_file_name text not null default '',
+  status text not null default 'queued',
+  total_leads integer not null default 0,
+  processed_leads integer not null default 0,
+  enriched_leads integer not null default 0,
+  failed_leads integer not null default 0,
+  classifier_model text not null default '',
+  writer_model text not null default '',
+  last_error text not null default '',
+  started_at timestamptz,
+  finished_at timestamptz,
+  last_heartbeat_at timestamptz,
+  created_at timestamptz not null default timezone('utc', now()),
+  updated_at timestamptz not null default timezone('utc', now())
+);
+
+alter table public.ai_import_jobs
+  drop constraint if exists ai_import_jobs_status_check;
+alter table public.ai_import_jobs
+  add constraint ai_import_jobs_status_check check (
+    status in ('queued', 'running', 'completed', 'completed_with_errors', 'failed')
+  );
+
+create table if not exists public.ai_import_job_items (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references public.ai_import_jobs(id) on delete cascade,
+  lead_id uuid not null references public.leads(id) on delete cascade,
+  status text not null default 'pending',
+  attempt_count integer not null default 0,
+  last_error text not null default '',
+  locked_at timestamptz,
+  created_at timestamptz not null default timezone('utc', now()),
+  updated_at timestamptz not null default timezone('utc', now()),
+  unique(job_id, lead_id)
+);
+
+alter table public.ai_import_job_items
+  drop constraint if exists ai_import_job_items_status_check;
+alter table public.ai_import_job_items
+  add constraint ai_import_job_items_status_check check (
+    status in ('pending', 'processing', 'enriched', 'failed')
+  );
+
 create index if not exists leads_market_id_idx on public.leads (market_id);
 create index if not exists leads_segment_id_idx on public.leads (segment_id);
 create index if not exists leads_batch_id_idx on public.leads (batch_id);
@@ -245,6 +293,8 @@ create index if not exists leads_assigned_user_idx on public.leads (assigned_use
 create index if not exists leads_ops_status_idx on public.leads (ops_status);
 create index if not exists leads_next_follow_up_idx on public.leads (next_follow_up_at);
 create index if not exists lead_activities_lead_id_idx on public.lead_activities (lead_id, created_at desc);
+create index if not exists ai_import_jobs_status_idx on public.ai_import_jobs (status, created_at desc);
+create index if not exists ai_import_job_items_job_status_idx on public.ai_import_job_items (job_id, status, created_at);
 
 insert into public.workspace_settings (id)
 values ('default')
@@ -432,6 +482,53 @@ before update on public.segment_assignments
 for each row
 execute function public.set_updated_at();
 
+drop trigger if exists ai_import_jobs_set_updated_at on public.ai_import_jobs;
+create trigger ai_import_jobs_set_updated_at
+before update on public.ai_import_jobs
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists ai_import_job_items_set_updated_at on public.ai_import_job_items;
+create trigger ai_import_job_items_set_updated_at
+before update on public.ai_import_job_items
+for each row
+execute function public.set_updated_at();
+
+create or replace function public.claim_ai_import_job_items(p_job_id uuid, p_limit integer default 8)
+returns setof public.ai_import_job_items
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.ai_import_job_items
+  set status = 'pending',
+      locked_at = null
+  where job_id = p_job_id
+    and status = 'processing'
+    and locked_at < timezone('utc', now()) - interval '5 minutes';
+
+  return query
+  with picked as (
+    select id
+    from public.ai_import_job_items
+    where job_id = p_job_id
+      and status = 'pending'
+    order by created_at asc
+    limit greatest(p_limit, 1)
+    for update skip locked
+  )
+  update public.ai_import_job_items as items
+  set status = 'processing',
+      locked_at = timezone('utc', now()),
+      attempt_count = items.attempt_count + 1,
+      updated_at = timezone('utc', now())
+  from picked
+  where items.id = picked.id
+  returning items.*;
+end;
+$$;
+
 create or replace function public.current_app_role()
 returns text
 language sql
@@ -458,6 +555,7 @@ $$;
 
 grant execute on function public.current_app_role() to authenticated;
 grant execute on function public.is_admin() to authenticated;
+grant execute on function public.claim_ai_import_job_items(uuid, integer) to authenticated;
 
 alter table public.markets enable row level security;
 alter table public.segments enable row level security;
@@ -467,6 +565,8 @@ alter table public.team_members enable row level security;
 alter table public.leads enable row level security;
 alter table public.segment_assignments enable row level security;
 alter table public.lead_activities enable row level security;
+alter table public.ai_import_jobs enable row level security;
+alter table public.ai_import_job_items enable row level security;
 
 drop policy if exists "markets_authenticated_all" on public.markets;
 drop policy if exists "segments_authenticated_all" on public.segments;
@@ -491,6 +591,8 @@ drop policy if exists "segment_assignments_self_select" on public.segment_assign
 drop policy if exists "lead_activities_select_scope" on public.lead_activities;
 drop policy if exists "lead_activities_insert_scope" on public.lead_activities;
 drop policy if exists "lead_activities_admin_delete" on public.lead_activities;
+drop policy if exists "ai_import_jobs_admin_all" on public.ai_import_jobs;
+drop policy if exists "ai_import_job_items_admin_all" on public.ai_import_job_items;
 
 create policy "markets_authenticated_read"
 on public.markets
@@ -626,6 +728,20 @@ for delete
 to authenticated
 using (public.is_admin());
 
+create policy "ai_import_jobs_admin_all"
+on public.ai_import_jobs
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+create policy "ai_import_job_items_admin_all"
+on public.ai_import_job_items
+for all
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
 grant usage on schema public to authenticated;
 
 grant select, insert, update, delete
@@ -636,7 +752,9 @@ on public.markets,
    public.team_members,
    public.leads,
    public.segment_assignments,
-   public.lead_activities
+   public.lead_activities,
+   public.ai_import_jobs,
+   public.ai_import_job_items
 to authenticated;
 
 grant usage, select
